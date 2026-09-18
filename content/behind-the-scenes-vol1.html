@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI社長ラボ ビハインドシーン Vol.1</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif; max-width: 760px; margin: 0 auto; padding: 32px 20px 80px; line-height: 1.85; background:#fdfdfb; color:#1a1a1a; }
+  h1 { font-size: 1.5rem; }
+  h2 { font-size: 1.15rem; margin-top: 2.4em; border-left: 4px solid #333; padding-left: 10px; }
+  pre { background:#1a1a1a; color:#d4f7d4; padding:16px; border-radius:8px; overflow-x:auto; font-size:0.85rem; white-space:pre-wrap; }
+  table { width:100%; border-collapse: collapse; margin: 16px 0; font-size: 0.9rem; }
+  th, td { border:1px solid #ddd; padding:8px; text-align:left; vertical-align: top; }
+  .note { color:#777; font-size:0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>AI社長ラボ ビハインドシーン Vol.1</h1>
+<p class="note">Claude Code（AI）にCEOとして「初期資金1万円→30日で純利益1万円」を目指させた実験の、実際のプロンプトと意思決定ログです。</p>
+
+<h2>1. 使った初期プロンプトの骨子</h2>
+<p>ユーザーがClaudeに与えた指示の核は以下でした（要約）：</p>
+<pre>あなたはこのプロジェクトのCEO兼事業責任者。
+初期資金は最大10,000円。30日間で合法かつ現実的な事業を
+ゼロから立ち上げ、純利益10,000円以上を第一目標として達成する。
+最終決定権は必ずCEOであるClaudeが持つ。
+サブエージェントは助言する。CEOが決める。
+トークンも経費として扱い、最小トークンで最大成果を出す。</pre>
+
+<h2>2. 候補選定：10案→3案</h2>
+<table>
+<tr><th>候補</th><th>初売上速度</th><th>利益率</th><th>30日実現性</th></tr>
+<tr><td>note有料記事</td><td>◎</td><td>◎</td><td>◎</td></tr>
+<tr><td>LINEスタンプ</td><td>△</td><td>◎</td><td>○</td></tr>
+<tr><td>BOOTHデジタル素材</td><td>○</td><td>◎</td><td>◎</td></tr>
+<tr><td>Kindle出版</td><td>△</td><td>○</td><td>△</td></tr>
+<tr><td>ココナラ代行</td><td>○</td><td>○（労働集約）</td><td>○</td></tr>
+</table>
+
+<h2>3. Market Research Agentへの実際の指示文</h2>
+<pre>WebSearchで以下を調査してください。深追いや網羅調査は不要、
+意思決定に必要な数字だけで構いません。
+1. LINE Creators Market：審査期間、販売手数料率、初月売上感
+2. note有料記事：販売手数料率、初売上までの目安期間
+3. BOOTHデジタルダウンロード：手数料率、振込手数料、価格帯の相場</pre>
+
+<h2>4. 判明した実データ</h2>
+<table>
+<tr><th>サービス</th><th>手取り率</th><th>リスク</th></tr>
+<tr><td>LINEスタンプ</td><td>約35%</td><td>約90%のクリエイターが無販売</td></tr>
+<tr><td>note</td><td>約85%（クレカ決済）</td><td>フォロワー基盤がないと集客に数週間</td></tr>
+<tr><td>BOOTH</td><td>約94%</td><td>公式APIなし、出品は手動</td></tr>
+</table>
+
+<h2>5. ピボットの経緯</h2>
+<p>当初はnote×既存Xフォロワー基盤（1,000人以上）を活かす計画でした。しかし「Claudeが本人確認・支払い以外は完全自動でやる」という追加要件が入り、公開APIの有無で再評価。結果、note/BOOTHは公式出品APIが存在せず脱落。Gumroad/Lemon Squeezyも商品登録API非対応と判明し、最終的に<strong>Stripe（商品・決済ページAPIが完全対応）＋GitHub Pages（無料ホスティング、git経由で全自動デプロイ）</strong>という構成に切り替えました。</p>
+
+<h2>6. 収支（このコンテンツ執筆時点）</h2>
+<table>
+<tr><th>項目</th><th>金額</th></tr>
+<tr><td>初期資金</td><td>10,000円</td></tr>
+<tr><td>累計経費</td><td>0円</td></tr>
+<tr><td>累計売上</td><td>本コンテンツの販売実績が最初の売上</td></tr>
+</table>
+
+<p class="note">続きはAI社長ラボのサイトで随時更新します。</p>
+
+</body>
+</html>
