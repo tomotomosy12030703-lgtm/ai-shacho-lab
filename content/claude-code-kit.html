@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Claude Code 全自動運営キット - AI社長ラボ</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif; max-width: 820px; margin: 0 auto; padding: 32px 20px 80px; line-height: 1.85; background:#fdfdfb; color:#1a1a1a; }
+  h1 { font-size: 1.5rem; }
+  h2 { font-size: 1.15rem; margin-top: 2.4em; border-left: 4px solid #333; padding-left: 10px; }
+  pre { background:#1a1a1a; color:#d4f7d4; padding:16px; border-radius:8px; overflow-x:auto; font-size:0.8rem; white-space:pre; }
+  table { width:100%; border-collapse: collapse; margin: 16px 0; font-size: 0.9rem; }
+  th, td { border:1px solid #ddd; padding:8px; text-align:left; vertical-align: top; }
+  .note { color:#777; font-size:0.85rem; }
+  .box { background:#f3f1ea; padding:14px 18px; border-radius:8px; }
+</style>
+</head>
+<body>
+<h1>Claude Code 全自動運営キット</h1>
+<p class="note">AI社長ラボ（Claudeが経営するビジネス実験）で実際に動いているコード・運用ルール・失敗集を、そのまま抜き出したものです。</p>
+<div class="box">
+<b>正直に書いておくこと</b><br>
+・このキットは「動いているもの」を載せています。売上や収益を保証するものではありません。実験開始2日目時点で売上は0円です。<br>
+・APIキー等の秘密情報は一切含まれません。あなた自身のキーを .env に置いて使います。<br>
+・X APIは従量課金です（実測：URLなし $0.015/件、URL付き $0.20/件）。
+</div>
+
+<h2>0. 全体構成</h2>
+<pre>Claude Code（CEO）
+  ├─ Stripe（決済・商品・Payment LinkをAPIで作成）
+  ├─ GitHub Pages（サイト。Contents APIでgit無しにデプロイ）
+  ├─ X API（投稿。キューから1件ずつ、Windowsタスクスケジューラで9:00/21:00）
+  ├─ Dev.to API（記事の自動投稿）
+  └─ 毎朝の実測（GitHub Traffic / Stripe を叩いて、KPI.md とサイトを更新）
+人間の仕事：本人確認・支払い承認・アカウント作成・固定ポストなどの「1操作」だけ</pre>
+
+<h2>1. x_post.py（X API v2への投稿ヘルパー）</h2>
+<p>標準ライブラリのみ。OAuth1.0a署名を自前実装。<b>失敗時は必ず例外</b>を出すのが要点です（失敗集 #3）。prefixで別アカウントの認証情報、reply_toで自己リプ投稿ができます。</p>
+<pre># -*- coding: utf-8 -*-
+&quot;&quot;&quot;X API v2 投稿ヘルパー（標準ライブラリのみ、OAuth1.0a自前署名）。
+
+- 失敗時は例外を送出する（呼び出し側が「成功時のみキューから消す」ために必須）
+- prefix を指定すると別アカウントの認証情報を使える（例: prefix=&quot;TOMOKI_&quot; → TOMOKI_X_API_KEY 等）
+- reply_to を指定するとそのツイートへの返信として投稿する（URL付き本文を自己リプに分離する用途）
+&quot;&quot;&quot;
+import base64
+import hashlib
+import hmac
+import json
+import random
+import string
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_URL = &quot;https://api.x.com/2/tweets&quot;
+
+
+def load_env(path):
+    env = {}
+    with open(path, encoding=&quot;utf-8&quot;) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith(&quot;#&quot;) or &quot;=&quot; not in line:
+                continue
+            k, v = line.split(&quot;=&quot;, 1)
+            env[k.strip()] = v.strip()
+    return env
+
+
+def _enc(s):
+    return urllib.parse.quote(str(s), safe=&quot;&quot;)
+
+
+def oauth1_header(method, url, api_key, api_secret, token, token_secret):
+    oauth_params = {
+        &quot;oauth_consumer_key&quot;: api_key,
+        &quot;oauth_nonce&quot;: &quot;&quot;.join(random.choices(string.ascii_letters + string.digits, k=32)),
+        &quot;oauth_signature_method&quot;: &quot;HMAC-SHA1&quot;,
+        &quot;oauth_timestamp&quot;: str(int(time.time())),
+        &quot;oauth_token&quot;: token,
+        &quot;oauth_version&quot;: &quot;1.0&quot;,
+    }
+    # JSONボディはOAuth署名対象に含めない
+    param_str = &quot;&amp;&quot;.join(f&quot;{_enc(k)}={_enc(v)}&quot; for k, v in sorted(oauth_params.items()))
+    base_str = &quot;&amp;&quot;.join([method.upper(), _enc(url), _enc(param_str)])
+    signing_key = f&quot;{_enc(api_secret)}&amp;{_enc(token_secret)}&quot;
+    oauth_params[&quot;oauth_signature&quot;] = base64.b64encode(
+        hmac.new(signing_key.encode(), base_str.encode(), hashlib.sha1).digest()
+    ).decode()
+    return &quot;OAuth &quot; + &quot;, &quot;.join(f&#x27;{_enc(k)}=&quot;{_enc(v)}&quot;&#x27; for k, v in sorted(oauth_params.items()))
+
+
+def post_tweet(env, text, prefix=&quot;&quot;, reply_to=None):
+    &quot;&quot;&quot;投稿して tweet id を返す。HTTPエラー時は RuntimeError。&quot;&quot;&quot;
+    header = oauth1_header(
+        &quot;POST&quot;, API_URL,
+        env[f&quot;{prefix}X_API_KEY&quot;], env[f&quot;{prefix}X_API_SECRET&quot;],
+        env[f&quot;{prefix}X_ACCESS_TOKEN&quot;], env[f&quot;{prefix}X_ACCESS_TOKEN_SECRET&quot;],
+    )
+    payload = {&quot;text&quot;: text}
+    if reply_to:
+        payload[&quot;reply&quot;] = {&quot;in_reply_to_tweet_id&quot;: str(reply_to)}
+    req = urllib.request.Request(API_URL, data=json.dumps(payload).encode(&quot;utf-8&quot;), method=&quot;POST&quot;)
+    req.add_header(&quot;Authorization&quot;, header)
+    req.add_header(&quot;Content-Type&quot;, &quot;application/json&quot;)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode(&quot;utf-8&quot;))[&quot;data&quot;][&quot;id&quot;]
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f&quot;HTTP {e.code}: {e.read().decode(&#x27;utf-8&#x27;, &#x27;replace&#x27;)}&quot;) from e
+
+
+if __name__ == &quot;__main__&quot;:
+    # usage: python x_post.py &lt;env_path&gt; &lt;text&gt; [prefix] [reply_to_id]
+    env = load_env(sys.argv[1])
+    print(post_tweet(env, sys.argv[2],
+                     prefix=sys.argv[3] if len(sys.argv) &gt; 3 else &quot;&quot;,
+                     reply_to=sys.argv[4] if len(sys.argv) &gt; 4 else None))
+</pre>
+
+<h2>2. daily_post.py（キューから1件投稿。成功時のみ消す）</h2>
+<p>marketing/post_queue.txt に1行1投稿で並べておくと、1件ずつ投稿して消化します。失敗した行は残り、post_log.txt にエラーが残ります。</p>
+<pre># -*- coding: utf-8 -*-
+import os
+import sys
+import datetime
+
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BASE)
+
+QUEUE_PATH = os.path.join(BASE, &quot;marketing&quot;, &quot;post_queue.txt&quot;)
+LOG_PATH = os.path.join(BASE, &quot;marketing&quot;, &quot;post_log.txt&quot;)
+ENV_PATH = os.path.join(BASE, &quot;.env&quot;)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import x_post  # marketing/x_post.py（失敗時は例外を送出するので、失敗した投稿はキューに残る）
+
+
+def main():
+    if not os.path.exists(QUEUE_PATH):
+        print(&quot;queue file not found&quot;)
+        return
+
+    with open(QUEUE_PATH, encoding=&quot;utf-8&quot;) as f:
+        lines = [l.rstrip(&quot;\n&quot;) for l in f]
+    lines = [l for l in lines if l.strip()]
+
+    if not lines:
+        print(&quot;queue is empty, nothing to post&quot;)
+        return
+
+    text = lines[0]
+    remaining = lines[1:]
+
+    env = x_post.load_env(ENV_PATH)
+
+    try:
+        x_post.post_tweet(env, text)
+        ok = True
+    except Exception as e:
+        ok = False
+        with open(LOG_PATH, &quot;a&quot;, encoding=&quot;utf-8&quot;) as f:
+            f.write(f&quot;{datetime.datetime.now().isoformat()} ERROR: {e} | text={text}\n&quot;)
+        print(&quot;post failed, keeping in queue:&quot;, e)
+        return
+
+    # only remove from queue on success
+    with open(QUEUE_PATH, &quot;w&quot;, encoding=&quot;utf-8&quot;) as f:
+        f.write(&quot;\n&quot;.join(remaining) + (&quot;\n&quot; if remaining else &quot;&quot;))
+
+    with open(LOG_PATH, &quot;a&quot;, encoding=&quot;utf-8&quot;) as f:
+        f.write(f&quot;{datetime.datetime.now().isoformat()} POSTED: {text}\n&quot;)
+
+    print(&quot;posted:&quot;, text)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</pre>
+
+<h2>3. register_task.ps1（毎日9:00/21:00に自動実行）</h2>
+<pre># 毎日9:00/21:00に投稿スクリプトを実行するタスクを登録する（PowerShell / 管理者権限不要）
+# 実運用中の設定値（絶対パス・StartWhenAvailable・WakeToRun）をそのまま再現している。
+$project = &quot;C:\path\to\your-project&quot;            # ← 自分のプロジェクトのパスに変える
+$py      = &quot;C:\Users\YOU\AppData\Local\Programs\Python\Python312\python.exe&quot;  # ← 素の &quot;python&quot; は不可。絶対パスで指定
+if (-not (Test-Path $py)) { throw &quot;python.exe が見つかりません: $py&quot; }
+
+$action   = New-ScheduledTaskAction -Execute $py `
+              -Argument &quot;$project\marketing\daily_post.py&quot; `
+              -WorkingDirectory &quot;$project\marketing&quot;
+$triggers = @(
+  (New-ScheduledTaskTrigger -Daily -At 9:00),
+  (New-ScheduledTaskTrigger -Daily -At 21:00)
+)
+# StartWhenAvailable: 時刻にPCがオフ/スリープでも、復帰後に実行する（これが無いと機会を逃して二度と動かない）
+# WakeToRun: スリープから起こして実行する
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
+              -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+Register-ScheduledTask -TaskName &quot;DailyPost&quot; -Action $action -Trigger $triggers -Settings $settings -Force
+
+# 動作確認（登録直後に1回手動実行して、結果コード0か見る）
+#   Start-ScheduledTask -TaskName &quot;DailyPost&quot;
+#   Get-ScheduledTask -TaskName &quot;DailyPost&quot; | Get-ScheduledTaskInfo | Select LastRunTime,LastTaskResult
+#   LastTaskResult が 0 以外なら失敗。2147942402(=ERROR_FILE_NOT_FOUND) は python のパス解決失敗。
+</pre>
+
+<h2>4. check_kpi.sh（毎朝の実測。すべて無料API）</h2>
+<pre>#!/bin/bash
+# 毎朝の実測チェック（すべて無料のAPIで、追加コストなし）。.env に各キーを置いて読み込む。
+# 使い方: bash check_kpi.sh
+set -a; . ./.env; set +a
+REPO=&quot;YOUR_GITHUB_USER/YOUR_REPO&quot;
+
+echo &quot;== サイト訪問(GitHub Traffic, 直近14日) ==&quot;
+curl -s -H &quot;Authorization: token $GITHUB_TOKEN&quot; \
+  &quot;https://api.github.com/repos/$REPO/traffic/views&quot; \
+  | python -c &quot;import sys,json;d=json.load(sys.stdin);print(&#x27;合計&#x27;,d.get(&#x27;count&#x27;),&#x27;ユニーク&#x27;,d.get(&#x27;uniques&#x27;))&quot;
+
+echo &quot;== 流入元(referrers) ==&quot;
+curl -s -H &quot;Authorization: token $GITHUB_TOKEN&quot; \
+  &quot;https://api.github.com/repos/$REPO/traffic/popular/referrers&quot;
+
+echo &quot;== ページ別(paths)。流入元別に /s/x.html /s/hatena.html を作って比べる ==&quot;
+curl -s -H &quot;Authorization: token $GITHUB_TOKEN&quot; \
+  &quot;https://api.github.com/repos/$REPO/traffic/popular/paths&quot;
+
+echo &quot;== Stripe 決済セッション/売上 ==&quot;
+curl -s -u &quot;$STRIPE_SECRET_KEY_LIVE:&quot; &quot;https://api.stripe.com/v1/checkout/sessions?limit=10&quot; \
+  | python -c &quot;import sys,json;d=json.load(sys.stdin);print(&#x27;sessions&#x27;,len(d.get(&#x27;data&#x27;,[])),d.get(&#x27;error&#x27;))&quot;
+curl -s -u &quot;$STRIPE_SECRET_KEY_LIVE:&quot; &quot;https://api.stripe.com/v1/charges?limit=10&quot; \
+  | python -c &quot;import sys,json;d=json.load(sys.stdin);print(&#x27;charges&#x27;,len(d.get(&#x27;data&#x27;,[])),d.get(&#x27;error&#x27;))&quot;
+
+# 注意: Traffic APIは日次集計で、直近の日が反映されるまで遅れる。クエリ文字列(?src=x)は集計されないため、
+#       流入元の切り分けは「別ページ(パス)」で行う。
+</pre>
+
+<h2>5. deploy_page.sh（git無しで本番サイトを更新）</h2>
+<pre>#!/bin/bash
+# GitHub Contents API で1ファイルを本番(GitHub Pages)へデプロイする。git不要、curlとpythonだけで動く。
+# 使い方: bash deploy_page.sh &lt;ローカルファイル&gt; &lt;リポジトリ内パス&gt;   例: bash deploy_page.sh site/index.html index.html
+set -e
+set -a; . ./.env; set +a
+REPO=&quot;YOUR_GITHUB_USER/YOUR_REPO&quot;
+SRC=&quot;$1&quot;; DEST=&quot;$2&quot;
+API=&quot;https://api.github.com/repos/$REPO/contents/$DEST&quot;
+
+# 既存ファイルのsha(更新に必須)。新規作成の場合は空でよい
+SHA=$(curl -s -H &quot;Authorization: token $GITHUB_TOKEN&quot; &quot;$API&quot; \
+      | python -c &quot;import sys,json;print(json.load(sys.stdin).get(&#x27;sha&#x27;,&#x27;&#x27;))&quot;)
+
+python - &quot;$SRC&quot; &quot;$SHA&quot; &quot;$DEST&quot; &gt; payload.json &lt;&lt;&#x27;EOF&#x27;
+import sys, json, base64
+src, sha, dest = sys.argv[1:4]
+body = {&quot;message&quot;: f&quot;update {dest}&quot;, &quot;content&quot;: base64.b64encode(open(src, &quot;rb&quot;).read()).decode()}
+if sha:
+    body[&quot;sha&quot;] = sha
+print(json.dumps(body))
+EOF
+
+curl -s -X PUT -H &quot;Authorization: token $GITHUB_TOKEN&quot; -d @payload.json &quot;$API&quot; \
+  | python -c &quot;import sys,json;d=json.load(sys.stdin);print(d.get(&#x27;commit&#x27;,{}).get(&#x27;sha&#x27;) or d.get(&#x27;message&#x27;))&quot;
+rm -f payload.json
+</pre>
+
+<h2>6. CLAUDE.md 雛形（AIに事業を任せる運営ルール）</h2>
+<p>予算・承認フロー・実測ルール・投稿ルール。「AIに任せる範囲」と「人間が握る範囲」の線引きが、この雛形の核心です。</p>
+<pre># CLAUDE.md（AIに事業を任せるときの運営ルール雛形）
+
+## 役割
+- Claude が CEO として全体を統括し、最終判断を行う。
+- 必要に応じて Sales / Marketing / Finance / Research のサブエージェントに意見を求めるが、決めるのはCEO。
+- 重要判断は DECISIONS.md に「理由・選択肢・撤退条件」付きで記録する。着手前に同種の過去判断がないか確認する。
+
+## 予算
+- 初期資金：__円（絶対上限、超過禁止）。残予算は BUDGET.md の値を正とし、過去分を遡って再計算しない。
+- 支出は少額でも「目的・金額・期待効果」をセットで BUDGET.md に追記する。
+- 売上は手数料控除前のgrossで記録し、手数料は経費側に計上する。
+
+## 承認フロー（ここが人間の仕事）
+- 次に該当する取り消しが難しい金銭操作は、実行前に必ず人間の承認を取る：
+  追加課金 / 新規契約・サブスク / 外部サービスへの支払い
+- 上記以外（コンテンツ作成・投稿・サイト更新など決済が絡まない作業）はCEO判断で進めてよい。
+- 本人確認・アカウント作成・個人の識別情報に関わる変更（ユーザー名、プロフィール等）はCEOが勝手に行わず、選択肢を提示して人間に判断を委ねる。
+
+## 実測ルール
+- 「多分こう」で判断しない。判断の前にAPIで実測する（訪問数・決済数・投稿のimpression）。
+- 実測できない数字を出すときは「仮定」と明記する。売上見込みを断言しない。
+- 毎日、KPIとサイトの数字を更新する。悪い数字も隠さず載せる。
+
+## 投稿ルール（X）
+- 実質文字数の上限は全角換算で約140字（加重文字数）。280字ではない。余裕を見て130字程度に収める。
+- URL付き投稿は課金が高い（実測 $0.20/件 vs URLなし $0.015/件）。本文にはURLを入れず、必要なときだけ自己リプに分離する。
+- 投稿スクリプトは「成功したときだけキューから消す」。失敗は例外にして必ずログに残す。
+
+## トークン節約
+- 同じ調査を繰り返さない。過去の DECISIONS.md / research/ を先に読む。
+- サブエージェントへの依頼には既知の制約（文字数上限など）を必ず明記して、手戻りを防ぐ。
+</pre>
+
+<h2>7. 実際に起きた失敗集（14件）</h2>
+<p>すべて実験中に実際に起きたことです。左が症状、右が対策です。</p>
+<table>
+<tr><th>#</th><th>何が起きたか</th><th>対策</th></tr>
+<tr><td>1</td><td><b>タスクスケジューラが「python」で無音失敗</b><br>アクションを素のコマンド名 python で登録したところ、スケジューラ実行時はPATH解決に失敗し ERROR_FILE_NOT_FOUND(2147942402) で何も言わずに落ちた。初日21:00の投稿が未実行だった。</td><td>python.exe の絶対パスを指定する。登録直後に Start-ScheduledTask で1回手動実行し、LastTaskResult=0 を確認する。</td></tr>
+<tr><td>2</td><td><b>PCがスリープ/オフだと二度と実行されない</b><br>StartWhenAvailable が False のままだと、時刻に電源が入っていない日は機会を逃してそれきりになる。</td><td>-StartWhenAvailable と -WakeToRun を付ける（register_task.ps1参照）。</td></tr>
+<tr><td>3</td><td><b>投稿失敗が「成功」扱いでキューから消えていた</b><br>投稿ヘルパーがHTTPエラーを print して None を返すだけで、呼び出し側は「例外が出なかった＝成功」と見なして投稿文をキューから削除していた。APIが落ちた日は、気づかないまま投稿が消える。2026-09-20に発見・修正。</td><td>失敗時は必ず例外を送出し、呼び出し側は例外を捕まえたときキューを消さずログに残す（x_post.py / daily_post.py参照）。</td></tr>
+<tr><td>4</td><td><b>スクリプトが一時フォルダのファイルに依存していた</b><br>自動投稿が、過去のAIセッションの一時ディレクトリにある別ファイルを読み込んでいた。一時フォルダは消えうるので、消えた日に自動投稿が全停止する。2026-09-20に発見・修正。</td><td>自動運用に使うコードは全部プロジェクト配下に置く。AIが生成したファイルの置き場所を、必ずレビューする。</td></tr>
+<tr><td>5</td><td><b>X投稿の文字数上限を誤って伝えられた</b><br>サブエージェントが「全角237字まで」と回答。実際は加重文字数で日本語は約140字。3投稿中2投稿が手動トリミングになった。</td><td>上限は約140字（余裕を見て130字）。サブエージェントへの依頼文に必ず明記する（CLAUDE.md雛形に記載）。</td></tr>
+<tr><td>6</td><td><b>URL付き投稿はコストが13倍</b><br>URLなし $0.015/件 に対し、URL付きは $0.20/件。毎回URL付きにすると、プリペイド残高が約2週間で尽きる計算だった。</td><td>本文にURLは入れない。必要な回だけ自己リプにURLを分離するか、プロフィール/固定ポストに誘導する。</td></tr>
+<tr><td>7</td><td><b>固定ポストをAPIで設定できなかった</b><br>Pinned Tweets APIが404。契約プランでは使えなかった。</td><td>人間の1タップに切り出す。自動化できない箇所は、最初から「人間の1操作」として設計に書いておく。</td></tr>
+<tr><td>8</td><td><b>本番のStripe書き込みがAIの安全装置でブロックされた</b><br>50%オフクーポンのPromotion Code作成が、Claude Codeの安全装置（本番書き込み）に止められた。</td><td>無理に回避せず、ダッシュボードでの手順を人間に渡す。クーポン本体はAPIで作れるが、有効化に人手が要る場合がある。</td></tr>
+<tr><td>9</td><td><b>個人の日常アカウントを事業用に転用した</b><br>個人の日常投稿と事業投稿が同じタイムラインに混在し、ユーザー名もブランドと不一致。訪問者から見ると信頼性を損なう。</td><td>事業用アカウントは分ける。個人の識別情報（ユーザー名等）の変更はAIが勝手にせず、人間に判断を委ねる。</td></tr>
+<tr><td>10</td><td><b>サイト訪問が14日連続で0だった</b><br>決済ページも商品もあるのに誰も来ていなかった。「投稿する」ことと「集客できている」ことは別だった。</td><td>毎朝 check_kpi.sh で訪問・決済を実測する。訪問0のうちは、価格や商品を触る前に流入経路を直す。</td></tr>
+<tr><td>11</td><td><b>プロフィールに導線が無かった</b><br>告知投稿にリンクが無く、プロフィールURLは別用途（note）のまま。興味を持っても購入に辿り着けなかった。</td><td>投稿→（固定ポスト/自己リプ）→サイト、の最短経路を確認してから投稿を増やす。</td></tr>
+<tr><td>12</td><td><b>OGPが無く、リンクが素の青文字になる</b><br>og:title/og:description/twitter:card が無いと、Xでリンクを貼ってもカード表示にならない。</td><td>サイトの head にOGPメタタグを入れる。</td></tr>
+<tr><td>13</td><td><b>「毎日更新します」と書いて更新していなかった</b><br>サイトに約束を書いたまま数字が古くなっていた。</td><td>毎朝のチェックで数字を更新してデプロイするところまで、手順に組み込む（deploy_page.sh）。</td></tr>
+<tr><td>14</td><td><b>Windows固有の落とし穴</b><br>PowerShell 5.1 は日本語レスポンスを表示時に文字化けさせることがある（実データは正しい）。Git Bashで schtasks を叩くと /フラグ がパス変換される。</td><td>文字化けはUTF-8で手動デコードして確認する。Windowsネイティブコマンドは PowerShell から実行する。</td></tr>
+</table>
+
+<h2>8. 実際のコスト実績</h2>
+<table>
+<tr><th>項目</th><th>金額</th></tr>
+<tr><td>X APIクレジット（1アカウント目）</td><td>820円</td></tr>
+<tr><td>X APIクレジット（2アカウント目）</td><td>816円</td></tr>
+<tr><td>X投稿 単価</td><td>URLなし $0.015／URL付き $0.20</td></tr>
+<tr><td>Stripe手数料</td><td>約3.6%</td></tr>
+<tr><td>GitHub Pages／Dev.to API／GitHub・Stripe実測API</td><td>0円</td></tr>
+</table>
+
+<h2>9. 使い始めの手順</h2>
+<pre>1. プロジェクトフォルダを作り、.env に各キーを書く（.gitignore に .env を必ず追加）
+2. marketing/ に x_post.py と daily_post.py を置く。post_queue.txt に投稿文を1行1件で入れる
+3. 手動で1回実行: python marketing\daily_post.py  → 1件投稿されるか確認
+4. register_task.ps1 のパスを直して実行 → Start-ScheduledTask で手動実行 → LastTaskResult=0 を確認
+5. CLAUDE.md.template を CLAUDE.md にして、予算・承認フローを自分用に書き換える
+6. 毎朝 check_kpi.sh で実測 → 数字が動くまで商品ではなく流入経路を直す</pre>
+
+<p class="note">© AI社長ラボ。個人利用は自由に改変してかまいません。再配布・転売はご遠慮ください。</p>
+</body>
+</html>
